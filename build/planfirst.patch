@@ -117,7 +117,7 @@ Only in b/src/android: app/src/main/assets/proot-aarch64
      private fun shellExecuteDefinition(): AgentToolDefinition = AgentToolDefinition(
 --- a/src/android/app/src/main/java/com/openminis/app/ui/chat/ChatViewModel.kt
 +++ b/src/android/app/src/main/java/com/openminis/app/ui/chat/ChatViewModel.kt
-@@ -238,6 +238,13 @@
+@@ -238,6 +238,19 @@
           */
          private const val MAX_AGENT_TURNS = 200
          private const val MIN_MAX_TOKENS = 1024
@@ -128,10 +128,16 @@ Only in b/src/android: app/src/main/assets/proot-aarch64
 +        // 防锁死：规划阶段包在 try-catch 里，任何异常静默跳过，绝不阻止
 +        // 后续带完整工具的循环——工具永远不会因规划失败而"消失"。
 +        private const val PLAN_FIRST_ENABLED = true
++        // 极短消息（"继续"、"好的"、"ok" 等确认/推进类）跳过规划，直接执行，
++        // 避免简单交互也白付一次规划调用（延迟 + token）。
++        private const val PLAN_MIN_CHARS = 8
++        // 规划阶段最大输出 token 上限：计划只需可执行的步骤清单，不需要长篇，
++        // 限制住能显著降低规划 token 消耗（对应 streamMessage 的 maxTokens 参数）。
++        private const val PLAN_MAX_TOKENS = 1500
          /**
           * Hard ceiling on max_tokens we ever send to a provider, regardless
           * of what the model itself claims. Some models advertise 128K+
-@@ -734,14 +741,38 @@
+@@ -734,14 +747,38 @@
      private val agentHistory = mutableListOf<LLMMessage>()
  
      /**
@@ -174,7 +180,7 @@ Only in b/src/android: app/src/main/assets/proot-aarch64
  
      /**
       * Per-session loop detector. Reset alongside [agentHistory] whenever the
-@@ -5888,6 +5919,62 @@
+@@ -5888,6 +5925,65 @@
          // we surface a real error instead of a silent blank bubble. Mirrors iOS
          // AIChatViewModel.didInjectEmptyToolReminderThisRun.
          var didInjectEmptyToolReminder = false
@@ -189,7 +195,8 @@ Only in b/src/android: app/src/main/assets/proot-aarch64
 +        // 永远不会因规划失败而"消失"。
 +        if (PLAN_FIRST_ENABLED &&
 +            agentHistory.isNotEmpty() &&
-+            agentHistory.last().role == LLMMessage.Role.USER
++            agentHistory.last().role == LLMMessage.Role.USER &&
++            (agentHistory.last().content?.length ?: 0) >= PLAN_MIN_CHARS
 +        ) {
 +            try {
 +                sanitizeAgentHistory()
@@ -202,13 +209,15 @@ Only in b/src/android: app/src/main/assets/proot-aarch64
 +                currentProvider.streamMessage(
 +                    applyRequestImageBudget(effectiveAgentHistory()),
 +                    systemPrompt,
-+                    dynamicMaxTokens(currentProvider, 0),
++                    minOf(dynamicMaxTokens(currentProvider, 0), PLAN_MAX_TOKENS),
 +                    tools = emptyList(),
-+                    thinkingLevel = if (currentModelSupportsReasoning) _thinkingLevel.value else ThinkingLevel.OFF,
++                    // 规划阶段强制纯文本：不开启 reasoning，只收集执行计划，
++                    // 避免思维链（reasoning_content）混入 <plan> 导致计划冗长、
++                    // 执行阶段重读 plan 时多付 token。
++                    thinkingLevel = ThinkingLevel.OFF,
 +                ).collect { chunk ->
 +                    when (chunk) {
 +                        is LLMStreamChunk.Text -> planSb.append(chunk.text)
-+                        is LLMStreamChunk.ThinkingDelta -> planSb.append(chunk.text)
 +                        else -> {}
 +                    }
 +                }
@@ -237,7 +246,7 @@ Only in b/src/android: app/src/main/assets/proot-aarch64
          for (turn in 0 until MAX_AGENT_TURNS) {
              // Sanitize history before each API call (mirrors iOS pre-API validation)
              sanitizeAgentHistory()
-@@ -7148,11 +7235,60 @@
+@@ -7148,11 +7244,60 @@
              "browser_use" -> executeBrowserUseTool(argsJson)
              "memory_write" -> executeMemoryWriteTool(argsJson)
              "memory_get" -> executeMemoryGetTool(argsJson)
@@ -298,7 +307,7 @@ Only in b/src/android: app/src/main/assets/proot-aarch64
       * Mirror of iOS AIChatViewModel post-tool hook (Agent/Chat/AIChatViewModel.swift:5387 / :5408):
       * when the agent writes or edits a SKILL.md inside a `/skills/` directory
       * we ask SkillRepository to re-scan disk so the new skill is visible
-@@ -7926,8 +8062,9 @@
+@@ -7926,8 +8071,9 @@
          // Pre-T122 the prompt embedded `Current time: yyyy-MM-dd HH:mm` mid-base,
          // which guaranteed cache misses across minute boundaries — even a quick
          // follow-up could land on a different minute and pay full ingestion.
