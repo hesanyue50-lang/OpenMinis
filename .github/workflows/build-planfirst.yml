@@ -1,0 +1,60 @@
+name: Build PlanFirst APK
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install SDK components & accept licenses
+        run: |
+          yes | sdkmanager --licenses > /dev/null 2>&1 || true
+          sdkmanager "platforms;android-36" "build-tools;34.0.0" > /dev/null 2>&1 || true
+
+      - name: Apply PlanFirst patch
+        run: git apply build/planfirst.patch
+
+      - name: Extract prebuilt native libs
+        run: |
+          mkdir -p src/android/app/src/main/jniLibs/arm64-v8a
+          tar xzf build/native-libs.tar.gz -C src/android/app/src/main/jniLibs/arm64-v8a/
+
+      - name: Download sandbox assets (rootfs + proot)
+        run: |
+          cd src/android/app/src/main/assets
+          curl -fSL -o alpine-minirootfs.tar.gz \
+            "https://dl-cdn.alpinelinux.org/alpine/v3.21/releases/aarch64/alpine-minirootfs-3.21.3-aarch64.tar.gz"
+          mkdir -p /tmp/proot && cd /tmp/proot
+          curl -fSL -o proot.deb \
+            "https://packages.termux.dev/apt/termux-main/pool/main/p/proot/proot_5.1.107.91_aarch64.deb"
+          ar x proot.deb
+          (unxz data.tar.xz || xz -d data.tar.xz || true)
+          tar xf data.tar
+          PROOT=$(find /tmp/proot -name proot -type f | head -1)
+          cp "$PROOT" "$GITHUB_WORKSPACE/src/android/app/src/main/assets/proot-aarch64"
+          chmod +x "$GITHUB_WORKSPACE/src/android/app/src/main/assets/proot-aarch64"
+
+      - name: Build APK
+        run: |
+          cd src/android
+          ./gradlew :app:assembleDebug --no-daemon
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: planfirst-apk
+          path: src/android/app/build/outputs/apk/debug/*.apk
+          if-no-files-found: error
