@@ -1,0 +1,287 @@
+--- a/src/android/app/build.gradle.kts
++++ b/src/android/app/build.gradle.kts
+@@ -33,11 +33,12 @@
+     compileSdk = 36
+ 
+     defaultConfig {
+-        applicationId = "com.openminis.app"
++        // Plan-First 测试版：独立 applicationId 与官方版并存，互不影响数据。
++        applicationId = "com.openminis.app.planfirst"
+         minSdk = 26
+         targetSdk = 35
+         versionCode = 20
+-        versionName = "0.20-preview"
++        versionName = "0.22-planfirst"
+ 
+         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
+ 
+@@ -53,19 +54,10 @@
+             abiFilters += listOf("arm64-v8a")
+         }
+ 
+-        externalNativeBuild {
+-            cmake {
+-                cppFlags += "-std=c++17"
+-                arguments += "-DANDROID_STL=c++_shared"
+-            }
+-        }
+-    }
+-
+-    externalNativeBuild {
+-        cmake {
+-            path = file("src/main/cpp/CMakeLists.txt")
+-            version = "3.22.1"
+-        }
++        // [Plan-First 测试版] 已禁用 externalNativeBuild：native 库
++        // (libjieba_jni/libpty_bridge/libminis_crash_handler/libproot 等)
++        // 已从官方 APK 提取到 jniLibs/arm64-v8a/，跳过 CMake 编译。
++        // 原因：NDK 工具链是 x86_64，aarch64 沙盒无法运行。
+     }
+ 
+     buildTypes {
+Only in b/src/android: app/provider-customization.properties
+Only in b/src/android: app/src/main/assets/alpine-minirootfs.tar.gz
+Only in b/src/android: app/src/main/assets/proot-aarch64
+--- a/src/android/app/src/main/java/com/openminis/app/tools/AgentTools.kt
++++ b/src/android/app/src/main/java/com/openminis/app/tools/AgentTools.kt
+@@ -21,6 +21,10 @@
+         // AIChatViewModel.makeAgentTools(memoryEnabled:).
+         memoryEnabled: Boolean = true,
+     ): List<AgentToolDefinition> = buildList {
++        // modify_tools 永远排在第一位：AI 用它动态屏蔽/恢复自己的工具集。
++        // 它自身永不进黑名单，保证"恢复工具"的逃生口始终存在（防锁死，
++        // 对应 deepseek-harness 里 exit_plan_mode 始终注册的设计）。
++        add(modifyToolsDefinition())
+         add(shellExecuteDefinition())
+         add(FileReadTool.definition())
+         add(FileWriteTool.definition())
+@@ -34,6 +38,33 @@
+             add(memoryGetDefinition())
+         }
+     }
++
++    // 动态工具集管理（对应 deepseek-harness 的 ctx.tools.restrict 语义）。
++    // AI 用它屏蔽/恢复/重置自己的工具，实现"规划阶段屏蔽复杂工具、
++    // 执行阶段恢复完整工具"的两阶段调度。
++    private fun modifyToolsDefinition(): AgentToolDefinition = AgentToolDefinition(
++        name = "modify_tools",
++        description = "Dynamically manage your own tool set (like a scoped tool restriction). " +
++            "Use it to temporarily hide tools during a planning/thinking phase and restore them " +
++            "when you are ready to execute. The deny list is session-scoped; `reset` restores " +
++            "everything. `modify_tools` itself can never be denied, so you can always recover. " +
++            "Use this instead of calling tools you plan to avoid — hiding them saves context " +
++            "tokens and keeps your attention focused.",
++        parameters = mapOf(
++            "action" to AgentToolParam(
++                "string",
++                "What to do: `deny` hides the listed tools, `allow` restores the listed tools, " +
++                    "`reset` restores ALL tools and clears the deny list.",
++                enumValues = listOf("deny", "allow", "reset"),
++            ),
++            "tools" to AgentToolParam(
++                "string",
++                "Comma-separated tool names (required for deny/allow), e.g. \"shell_execute,browser_use\". " +
++                    "Ignored for reset.",
++            ),
++        ),
++        required = listOf("action"),
++    )
+ 
+     // Aligned with iOS AIChatViewModel.swift:4982-4993
+     private fun shellExecuteDefinition(): AgentToolDefinition = AgentToolDefinition(
+--- a/src/android/app/src/main/java/com/openminis/app/ui/chat/ChatViewModel.kt
++++ b/src/android/app/src/main/java/com/openminis/app/ui/chat/ChatViewModel.kt
+@@ -238,6 +238,13 @@
+          */
+         private const val MAX_AGENT_TURNS = 200
+         private const val MIN_MAX_TOKENS = 1024
++        // Plan-First 两阶段调度开关（测试版）：true = 每个用户 turn 先做一轮
++        // 空工具的纯思考（形成完整思维链/执行计划），再归还完整工具统一执行。
++        // 目的：让模型注意力先排好思维链，减少"边想边调"的碎片化工具调用，
++        // 降低 token 消耗、提升执行连贯性。
++        // 防锁死：规划阶段包在 try-catch 里，任何异常静默跳过，绝不阻止
++        // 后续带完整工具的循环——工具永远不会因规划失败而"消失"。
++        private const val PLAN_FIRST_ENABLED = true
+         /**
+          * Hard ceiling on max_tokens we ever send to a provider, regardless
+          * of what the model itself claims. Some models advertise 128K+
+@@ -734,14 +741,38 @@
+     private val agentHistory = mutableListOf<LLMMessage>()
+ 
+     /**
++     * Session-scoped tool deny list, mutated by the AI through the
++     * `modify_tools` tool (mirrors deepseek-harness `ctx.tools.restrict`).
++     * `modify_tools` itself is never filtered out, so the recovery escape
++     * hatch always exists — the AI can never lock itself out of its tools.
++     * The agent loop dispatches tool calls single-threaded, so a plain
++     * mutable set is safe without extra synchronization.
++     */
++    private val toolDenyList = mutableSetOf<String>()
++
++    /**
++     * Session-scoped "current date" frozen at ViewModel creation.
++     * The system prompt's Runtime-context date previously used
++     * [java.time.LocalDate.now()] on every request, so any conversation
++     * spanning midnight changed the date mid-prefix and invalidated the
++     * entire history for DeepSeek/OpenAI prefix caching. Freezing it per
++     * session keeps the static prefix byte-stable across day boundaries;
++     * a fresh ViewModel (new session / process restart) naturally picks up
++     * the new date.
++     */
++    private val sessionDateStr: String =
++        java.time.LocalDate.now().format(java.time.format.DateTimeFormatter.ISO_LOCAL_DATE)
++
++    /**
+      * All agent tool definitions, recomputed on each read so the memory
+-     * toggle gate (see [_memoryEnabled]) takes effect immediately when
+-     * the user flips /memory mid-session without forcing a VM rebuild.
+-     * The cost is negligible — [AgentTools.makeAgentTools] just builds a
+-     * fixed list of definition objects, no I/O.
++     * toggle gate (see [_memoryEnabled]) and the [toolDenyList] take effect
++     * immediately on the next agent-loop turn. The cost is negligible —
++     * [AgentTools.makeAgentTools] just builds a fixed list of definition
++     * objects, no I/O.
+      */
+     private val agentTools: List<AgentToolDefinition>
+         get() = AgentTools.makeAgentTools(memoryEnabled = _memoryEnabled.value)
++            .filter { it.name == "modify_tools" || it.name !in toolDenyList }
+ 
+     /**
+      * Per-session loop detector. Reset alongside [agentHistory] whenever the
+@@ -5888,6 +5919,62 @@
+         // we surface a real error instead of a silent blank bubble. Mirrors iOS
+         // AIChatViewModel.didInjectEmptyToolReminderThisRun.
+         var didInjectEmptyToolReminder = false
++
++        // ===== Plan-First 两阶段规划 =====
++        // 第一轮：空工具列表，模型纯思考，形成完整思维链/执行计划。
++        // 第二轮起（下方主循环）：归还完整 agentTools，按计划统一执行。
++        // 设计目标：让模型注意力先排好思维链，减少"边想边调"的碎片化工具
++        // 调用，降低 token 消耗、提升执行连贯性。
++        // 防锁死（关键）：规划阶段包在 try-catch 里，任何异常（超时、空响应、
++        // 模型不支持等）都静默跳过，直接进入下方带完整工具的循环——工具
++        // 永远不会因规划失败而"消失"。
++        if (PLAN_FIRST_ENABLED &&
++            agentHistory.isNotEmpty() &&
++            agentHistory.last().role == LLMMessage.Role.USER
++        ) {
++            try {
++                sanitizeAgentHistory()
++                // 缓存命中优化：规划阶段不修改 systemPrompt，保持请求前缀
++                // 稳定（DeepSeek/Anthropic 的 prompt cache 按前缀匹配，
++                // systemPrompt 变化会导致缓存失效、输入 token 翻倍）。
++                // tools 为空本身就是最强引导——模型没有工具可用，自然只能
++                // 输出计划文本，而非空转或抱怨。
++                val planSb = StringBuilder()
++                currentProvider.streamMessage(
++                    applyRequestImageBudget(effectiveAgentHistory()),
++                    systemPrompt,
++                    dynamicMaxTokens(currentProvider, 0),
++                    tools = emptyList(),
++                    thinkingLevel = if (currentModelSupportsReasoning) _thinkingLevel.value else ThinkingLevel.OFF,
++                ).collect { chunk ->
++                    when (chunk) {
++                        is LLMStreamChunk.Text -> planSb.append(chunk.text)
++                        is LLMStreamChunk.ThinkingDelta -> planSb.append(chunk.text)
++                        else -> {}
++                    }
++                }
++                val planText = planSb.toString().trim()
++                if (planText.isNotEmpty()) {
++                    AppLogger.info(
++                        TAG_STREAM,
++                        "Plan-First: planning pass produced ${planText.length} chars, injecting as <plan> into history",
++                    )
++                    // 把计划作为 assistant 消息注入，执行阶段模型能看到并基于它统一执行。
++                    agentHistory.add(
++                        LLMMessage(
++                            role = LLMMessage.Role.ASSISTANT,
++                            content = "<plan>\n$planText\n</plan>",
++                        )
++                    )
++                }
++            } catch (e: CancellationException) {
++                // 用户取消必须向上传播，不能被下面 catch (Exception) 吞掉。
++                throw e
++            } catch (e: Exception) {
++                AppLogger.warning(TAG_STREAM, "Plan-First: planning pass failed, skipping: ${e.message}")
++            }
++        }
++
+         for (turn in 0 until MAX_AGENT_TURNS) {
+             // Sanitize history before each API call (mirrors iOS pre-API validation)
+             sanitizeAgentHistory()
+@@ -7148,11 +7235,60 @@
+             "browser_use" -> executeBrowserUseTool(argsJson)
+             "memory_write" -> executeMemoryWriteTool(argsJson)
+             "memory_get" -> executeMemoryGetTool(argsJson)
++            "modify_tools" -> executeModifyTools(argsJson)
+             else -> ToolExecutionResult("Unknown tool: $name", false)
+         }
+     }
+ 
+     /**
++     * Implements the `modify_tools` tool — the AI's session-scoped tool
++     * restriction (mirrors deepseek-harness `ctx.tools.restrict`).
++     *
++     * `deny` hides tools for the rest of the session; `allow` restores them;
++     * `reset` clears the deny list. `modify_tools` itself can never be
++     * denied (filtered in [agentTools] above), so the escape hatch always
++     * exists — the AI cannot lock itself out.
++     */
++    private fun executeModifyTools(argsJson: String): ToolExecutionResult {
++        return try {
++            val obj = JSONObject(argsJson)
++            val action = obj.optString("action", "").trim().lowercase()
++            val rawNames = obj.optString("tools", "")
++            val names = rawNames.split(',').map { it.trim() }.filter { it.isNotEmpty() }
++            when (action) {
++                "deny" -> {
++                    names.forEach { toolDenyList.add(it) }
++                    ToolExecutionResult(
++                        "Hidden tools: ${names.joinToString(", ")}. " +
++                            "Currently visible: ${visibleToolNames()}", true
++                    )
++                }
++                "allow" -> {
++                    names.forEach { toolDenyList.remove(it) }
++                    ToolExecutionResult(
++                        "Restored tools: ${names.joinToString(", ")}. " +
++                            "Currently visible: ${visibleToolNames()}", true
++                    )
++                }
++                "reset" -> {
++                    toolDenyList.clear()
++                    ToolExecutionResult("Restored all tools. Visible: ${visibleToolNames()}", true)
++                }
++                else -> ToolExecutionResult(
++                    "Unknown action: \"$action\" (expected deny/allow/reset). " +
++                        "Currently visible: ${visibleToolNames()}", false
++                )
++            }
++        } catch (e: Exception) {
++            ToolExecutionResult("modify_tools failed: ${e.message}", false)
++        }
++    }
++
++    /** Comma-separated names of tools currently visible to the model. */
++    private fun visibleToolNames(): String =
++        agentTools.joinToString(", ") { it.name }
++
++    /**
+      * Mirror of iOS AIChatViewModel post-tool hook (Agent/Chat/AIChatViewModel.swift:5387 / :5408):
+      * when the agent writes or edits a SKILL.md inside a `/skills/` directory
+      * we ask SkillRepository to re-scan disk so the new skill is visible
+@@ -7926,8 +8062,9 @@
+         // Pre-T122 the prompt embedded `Current time: yyyy-MM-dd HH:mm` mid-base,
+         // which guaranteed cache misses across minute boundaries — even a quick
+         // follow-up could land on a different minute and pay full ingestion.
+-        val today = java.time.LocalDate.now()
+-        val dateStr = today.format(java.time.format.DateTimeFormatter.ISO_LOCAL_DATE)
++        // 会话级固定日期（见 [sessionDateStr] 字段），跨天不改变前缀，
++        // 保持 DeepSeek/OpenAI 前缀缓存命中。
++        val dateStr = sessionDateStr
+         val tzId = java.util.TimeZone.getDefault().id
+         val lang = context.resources.configuration.locales[0].toLanguageTag()
+ 
+Only in b/src/android: local.properties
