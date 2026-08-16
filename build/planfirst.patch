@@ -15,7 +15,7 @@
  
          testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
  
-@@ -53,19 +54,10 @@
+@@ -53,29 +54,36 @@
              abiFilters += listOf("arm64-v8a")
          }
  
@@ -25,20 +25,44 @@
 -                arguments += "-DANDROID_STL=c++_shared"
 -            }
 -        }
--    }
--
--    externalNativeBuild {
--        cmake {
--            path = file("src/main/cpp/CMakeLists.txt")
--            version = "3.22.1"
--        }
 +        // [Plan-First 测试版] 已禁用 externalNativeBuild：native 库
 +        // (libjieba_jni/libpty_bridge/libminis_crash_handler/libproot 等)
 +        // 已从官方 APK 提取到 jniLibs/arm64-v8a/，跳过 CMake 编译。
 +        // 原因：NDK 工具链是 x86_64，aarch64 沙盒无法运行。
      }
  
+-    externalNativeBuild {
+-        cmake {
+-            path = file("src/main/cpp/CMakeLists.txt")
+-            version = "3.22.1"
++    // [Plan-First 测试版] 固定签名：显式指向仓库里的 planfirst.keystore，
++    // 让每次 CI 构建签名一致，实现 pm install -r 覆盖安装（数据不丢）。
++    // 不依赖 AGP 默认 ~/.android/debug.keystore（实测 CI 上 AGP 每次仍生成
++    // 随机 debug 证书，导致两次构建签名不同、无法覆盖安装）。
++    signingConfigs {
++        create("planfirst") {
++            storeFile = file("planfirst.keystore")
++            storePassword = "android"
++            keyAlias = "androiddebugkey"
++            keyPassword = "android"
+         }
+     }
+ 
      buildTypes {
++        debug {
++            signingConfig = signingConfigs.getByName("planfirst")
++        }
+         release {
+             isMinifyEnabled = true
+             proguardFiles(
+                 getDefaultProguardFile("proguard-android-optimize.txt"),
+                 "proguard-rules.pro"
+             )
+-            signingConfig = signingConfigs.getByName("debug")
++            signingConfig = signingConfigs.getByName("planfirst")
+         }
+     }
+ 
 Only in b/src/android: app/provider-customization.properties
 Only in b/src/android: app/src/main/assets/alpine-minirootfs.tar.gz
 Only in b/src/android: app/src/main/assets/proot-aarch64

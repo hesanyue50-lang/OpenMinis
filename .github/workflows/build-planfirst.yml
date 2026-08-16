@@ -49,9 +49,8 @@ jobs:
 
       - name: Restore fixed debug keystore
         run: |
-          mkdir -p ~/.android
-          base64 -d build/debug.keystore.b64 > ~/.android/debug.keystore
-          keytool -list -keystore ~/.android/debug.keystore -storepass android | grep androiddebugkey
+          base64 -d build/debug.keystore.b64 > src/android/app/planfirst.keystore
+          keytool -list -keystore src/android/app/planfirst.keystore -storepass android | grep androiddebugkey
 
       - name: Build APK
         run: |
