@@ -42,6 +42,32 @@
 Only in b/src/android: app/provider-customization.properties
 Only in b/src/android: app/src/main/assets/alpine-minirootfs.tar.gz
 Only in b/src/android: app/src/main/assets/proot-aarch64
+--- a/src/android/app/src/main/java/com/openminis/app/sandbox/NativeOffload.kt
++++ b/src/android/app/src/main/java/com/openminis/app/sandbox/NativeOffload.kt
+@@ -1,5 +1,6 @@
+ package com.openminis.app.sandbox
+ 
++import com.openminis.app.BuildConfig
+ import android.net.LocalServerSocket
+ import android.net.LocalSocket
+ import android.util.Log
+@@ -52,12 +53,14 @@
+ 
+ object NativeOffloadServer {
+     private const val TAG = "NativeOffloadServer"
+-    private const val SOCKET_NAME = "native-offload"
++    // 测试版与官方版并存时 abstract socket 名字必须唯一（官方版已占用
++    // "native-offload"，测试版用 applicationId 后缀，否则 EADDRINUSE 闪退）。
++    private val SOCKET_NAME = "native-offload-" + BuildConfig.APPLICATION_ID.substringAfterLast('.')
+     private const val MAGIC_REQ = 0x46464F4E  // 'N' 'O' 'F' 'F' little-endian
+     private const val MAGIC_RSP = 0x52464F4E  // 'N' 'O' 'F' 'R'
+     private const val VERSION = 1
+ 
+-    const val socketName: String = SOCKET_NAME
++    val socketName: String = SOCKET_NAME
+ 
+     private val handlers = ConcurrentHashMap<String, NativeOffloadHandler>()
+     private val counter = AtomicLong(0)
 --- a/src/android/app/src/main/java/com/openminis/app/tools/AgentTools.kt
 +++ b/src/android/app/src/main/java/com/openminis/app/tools/AgentTools.kt
 @@ -21,6 +21,10 @@
