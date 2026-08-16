@@ -49,6 +49,7 @@ jobs:
 
       - name: Build APK
         run: |
+          mkdir -p .claude/skills/debug-server
           cd src/android
           ./gradlew :app:assembleDebug --no-daemon
 
