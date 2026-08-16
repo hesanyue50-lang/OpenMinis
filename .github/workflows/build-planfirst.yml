@@ -47,6 +47,12 @@ jobs:
           cp "$PROOT" "$GITHUB_WORKSPACE/src/android/app/src/main/assets/proot-aarch64"
           chmod +x "$GITHUB_WORKSPACE/src/android/app/src/main/assets/proot-aarch64"
 
+      - name: Restore fixed debug keystore
+        run: |
+          mkdir -p ~/.android
+          base64 -d build/debug.keystore.b64 > ~/.android/debug.keystore
+          keytool -list -keystore ~/.android/debug.keystore -storepass android | grep androiddebugkey
+
       - name: Build APK
         run: |
           mkdir -p .claude/skills/debug-server
